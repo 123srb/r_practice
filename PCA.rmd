@@ -1,0 +1,301 @@
+---
+title: "PCA Crime"
+author: "Steven Burgess"
+date: "2024-02-16"
+output: pdf_document
+---
+
+```{r}
+rm(list = ls())
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff = 60), tidy = TRUE)
+library(caret)
+library('corrplot')
+library(gplots)
+library('ggplot2')
+library(gridExtra)
+library(stats)
+library(GGally)
+library(recipes)
+library(DAAG)
+
+set.seed(6501)
+
+
+#import data
+df <- read.table("uscrime.txt", sep = "\t", stringsAsFactors = FALSE, header= TRUE)
+head(df)
+```
+
+
+```{r  fig.width=8, fig.height=8}
+
+
+#This graph is gigantic, so I'll just output the ones in my previous modeling attempt
+#ggpairs(df)
+ggpairs(subset(df, select = c('M','Po1', 'Ed', 'U2', 'Ineq', 'Prob','Crime')))
+corrplot(cor(df), method='circle', is.corr=FALSE)
+```
+
+```{r}
+#Set a variable equal to every column except Crime
+predictors = setdiff(names(df), "Crime")
+
+# Perform PCA on the predictors
+pca_result = prcomp(~., df[predictors], scale = TRUE)
+
+screeplot(pca_result, type="lines",col="blue")
+# View summary of PCA to help decide on the number of components to retain
+summary(pca_result)
+biplot(pca_result)
+```
+
+```{r}
+
+# Create a dataframe with the selected principal components
+chosen_pcas = pca_result$x[, 1:4]
+
+pc_df <- as.data.frame(pca_result$x[, 1:4])
+
+# Add the target variable to this dataframe
+pc_df$Crime <- df$Crime
+
+#using caret, define the training groups, sticking with 5 because we don't have a lot of data (same reason I don't have a test set)
+#opting for caret over cv.lm because its easier to get r squared
+train_control <- trainControl(method = "cv", number = 5, summaryFunction = defaultSummary)
+
+# use it to perform cross validation
+lm_model_cv <- train(Crime ~ ., data = pc_df, method = "lm", trControl = train_control)
+
+cv_results <- lm_model_cv$results
+
+# Take the average of every fold to be our R squared
+mean_r_squared_cv <- mean(cv_results$Rsquared, na.rm = TRUE)
+
+# Print the mean R^2
+cat("Mean R-squared from CV:", mean_r_squared_cv, "\n")
+
+
+mean_rmse_cv <- mean(cv_results$RMSE, na.rm = TRUE)
+cat("Mean RMSE from CV:", mean_rmse_cv, "\n")
+
+# Back out of RMSE to get SSE
+n <- nrow(pc_df)  
+sse_cv <- n * (mean_rmse_cv^2)
+cat("Estimated SSE from CV:", sse_cv, "\n")
+
+
+```
+
+```{r}
+#grab the final fitted model
+final_lm_model = lm_model_cv$finalModel
+pca_coefficients = coef(final_lm_model)
+
+
+#rotation holds the eigen vecors in it which we can use to reverse.  This maps the PCA components back to the scaled space
+# don't use the first value because that is the intercept
+model_coefficients_scaled = pca_result$rotation[,1:4] %*% pca_coefficients[2:5]
+#unscale by dividing by standard deviation, this will divide each coeficient by its corresponding sd
+
+# This works this way
+
+# Y = a0 + aX
+
+#substitute scaling and centering in.  Wouldn't apply to the intercept so
+
+# Y = a0 + a([X-mean(X)] /  sd(X))
+
+# Expand
+
+# Y = a0 + a/sd(X) * X - a*mean(X)/SD(X)
+
+# rearrage
+
+# Y = a0 - a*mean(X)/SD(X) + a/sd(X) * X
+
+model_coefficients = model_coefficients_scaled/sapply(df[,1:15],sd)
+
+print(model_coefficients)
+#our intercept is where all the randomness gets tossed. 
+intercept = pca_coefficients[1] - sum(model_coefficients_scaled*sapply(df[,1:15], mean)/sapply(df[,1:15], sd))
+
+#This new point needs to be scaled to work with the PCA values we had
+new_point <- data.frame(M = 14.0, So = 0, Ed = 10.0, Po1 = 12.0, Po2 = 15.5
+                        , LF = 0.640, M.F = 94.0, Pop = 150, NW = 1.1
+                        , U1 = 0.120, U2 = 3.6, Wealth = 3200, Ineq = 20.1
+                        , Prob = 0.04, Time = 39.0)
+
+scaled_new_point <- sapply(names(new_point), function(feature) {
+  (new_point[[feature]] - mean(df[[feature]], na.rm = TRUE)) / sd(df[[feature]], na.rm = TRUE)
+})
+
+prediction = sum(scaled_new_point*model_coefficients_scaled) + pca_coefficients[1]
+cat("Prediction:", prediction, "\n")
+```
+
+```{r}
+
+train_control <- trainControl(method = "cv", number = 5, summaryFunction = defaultSummary)
+
+# use it to perform cross validation
+lm_model_cv <- train(Crime ~ M + Ed + U2 + Prob, data = df, method = "lm", trControl = train_control)
+
+cv_results <- lm_model_cv$results
+
+
+# Take the average of every fold to be our R squared
+mean_r_squared_cv <- mean(cv_results$Rsquared, na.rm = TRUE)
+
+# Print the mean R^2
+cat("Mean R-squared from CV:", mean_r_squared_cv, "\n")
+
+
+mean_rmse_cv <- mean(cv_results$RMSE, na.rm = TRUE)
+cat("Mean RMSE from CV:", mean_rmse_cv, "\n")
+
+# Back out of RMSE to get SSE
+n <- nrow(df)  
+sse_cv <- n * (mean_rmse_cv^2)
+cat("Estimated SSE from CV:", sse_cv, "\n")
+
+
+prediction = predict(lm_model_cv, new_point)
+cat("Prediction:", prediction, "\n")
+```
+
+# Summary
+
+Comparing the two models seems we seem all of our error score have improvement. In addition we have a value closer to what I found by looking for the next closest state based on euclidean distance. It looks like PCA was able to improve the model.
+
+```{r}
+#Is the output reasonable?  I'm going to do something fun and try to find a point that is similar to our new_point using euclidean distance
+
+find_most_similar <- function(df, new_point, predictors) {
+  
+  #We need to scale our data because we know there are different levels for values.  For example we don't want M to count more than Prob does
+  df_scaled <- df
+  df_scaled[predictors] <- scale(df[predictors])
+  
+  # Scale the new_point using the same scaling parameters (mean and std dev) as the dataframe
+  scale_params <- lapply(df[predictors], function(x) list(mean = mean(x, na.rm = TRUE), sd = sd(x, na.rm = TRUE)))
+  new_point_scaled <- new_point
+  for (predictor in predictors) {
+    new_point_scaled[[predictor]] <- (new_point[[predictor]] - scale_params[[predictor]]$mean) / scale_params[[predictor]]$sd
+  }
+  
+  # Calculate euclidean distances for each point in the dataframe
+  distances <- apply(df[predictors], 1, function(row) {
+    sqrt(sum((row - unlist(new_point[predictors]))^2))
+  })
+  
+  # Add distances as a new column in the dataframe
+  df$Distance <- distances
+  
+  # Sort the dataframe by distance, from smallest to largest (most alike to least alike)
+  df_sorted <- df[order(df$Distance), ]
+  
+  return(df_sorted)
+}
+
+predictors = c('M','Po1', 'Ed', 'U2', 'Ineq', 'Prob')
+
+# Find all points in 'df' sorted by similarity to 'new_point'
+similar_points_sorted <- find_most_similar(df, new_point, predictors)
+head(similar_points_sorted)
+```
+
+# ETC
+
+Another method to accomplish the same thing
+
+```{r}
+new_point <- data.frame(M = 14.0, So = 0, Ed = 10.0, Po1 = 12.0, Po2 = 15.5
+                        , LF = 0.640, M.F = 94.0, Pop = 150, NW = 1.1
+                        , U1 = 0.120, U2 = 3.6, Wealth = 3200, Ineq = 20.1
+                        , Prob = 0.04, Time = 39.0)
+
+#It sounded like they wanted us to do the nitty gritty calcs so I ended up doing them too
+
+# Define a recipe for preprocessing
+recipe = recipe(Crime ~ ., data = df) %>%
+  step_center(all_predictors()) %>%  # Centering predictors
+  step_scale(all_predictors()) %>%   # Scaling predictors
+  step_pca(all_predictors(), num_comp = 4)  # Appl PCA, retaining first 4 components
+
+# Set up the training control
+train_control = trainControl(method = "cv", number = 5)  # 5-folds
+
+model = train(recipe, data = df, method = "lm", trControl = train_control)
+
+predictions = predict(model,df)
+
+# SSE, RMSE, SS, R squared
+sse = sum((predictions - df$Crime)^2)
+rmse = sqrt(mean((predictions - df$Crime)^2))
+ss_total = sum((df$Crime - mean(df$Crime))^2)
+r_squared = 1 - sse / ss_total
+
+cat("SSE:", sse, "\nRMSE:", rmse, "\nR-squared:", r_squared, "\n")
+
+new_point = data.frame(M = 14.0, So = 0, Ed = 10.0, Po1 = 12.0, Po2 = 15.5
+                       , LF = 0.640,M.F = 94.0, Pop = 150, NW = 1.1, U1 = 0.120
+                       , U2 = 3.6, Wealth = 3200, Ineq = 20.1, Prob = 0.04
+                       , Time = 39.0)
+
+# make a prediction, thanks to the recipe, I don't need to scale and center again
+new_point_prediction <- predict(model, new_point)
+print(new_point_prediction)
+
+```
+
+```{r}
+crime_lin_reg = function(df, predictors, new_point){
+  
+#split into 5 groups, we only have 47 points so this is probably our best bet for now  
+  num_folds = 5
+  folds =  createFolds(df$Crime, k = num_folds)
+  
+  #variables for output
+  rmse_values = numeric(length(num_folds))
+  sse_values = numeric(length(num_folds))
+  r_squared_values <- numeric(length(num_folds))  # For storing R-squared values
+  new_point_pred = numeric(length(num_folds))
+  for(i in seq_along(folds)) {
+    
+    # use the folds we made to define our test and training sets
+    train_data = df[-folds[[i]], ]
+    validation_data = df[folds[[i]], ]
+    
+    #take our predictors array and make them a string, then change it to a formula because lm won't take a string as an arguement
+    lm_formula <- as.formula(paste("Crime ~", paste(predictors, collapse = " + ")))
+    lm_model = lm(lm_formula, data = train_data)
+    
+    # Predict on the test set
+    predictions = predict(lm_model, newdata = validation_data)
+    
+    # Calculate RMSE and SSE for this fold
+    rmse_values[i] = sqrt(mean((predictions - validation_data$Crime)^2))
+    sse_values[i] = sum((predictions - validation_data$Crime)^2)
+   # Calculate R-squared for this fold
+    ss_total = sum((validation_data$Crime - mean(validation_data$Crime))^2)
+    r_squared_values[i] = 1 - (sse_values[i] / ss_total)
+
+new_point_pred[i] = predict(lm_model, new_point)  
+  }
+ 
+  # Average RMSE and SEE across all folds
+  mean_rmse = mean(rmse_values)
+  mean_sse = mean(sse_values)
+  mean_r_squared = mean(r_squared_values)
+  mean_new_point_prediction = mean(new_point_pred)
+  
+  
+  cat(paste("\n mean SSE is: ",round(mean_sse), " \n mean RMSE is: ", round(mean_rmse), "\n New point Prediction is: ", round(mean_new_point_prediction), "\n R Squared is: ", mean_r_squared))
+}
+
+crime_lin_reg(df, c('M', 'Ed', 'U2', 'Prob'), new_point)
+
+```
